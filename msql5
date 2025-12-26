@@ -1,0 +1,255 @@
+#property strict
+
+//================ INPUTS =================
+input int    MagicNumber = 777;
+
+// Indicators
+input int RSI_Period = 14;
+input int ATR_Period = 14;
+
+// MACD (M15)
+input int MACD_Fast = 12;
+input int MACD_Slow = 26;
+input int MACD_Signal = 9;
+
+// Higher TF
+input int HTF_EMA_Period = 200;
+
+// Risk & reward
+input double RiskPercent = 1.0;   // 1% risk
+input double RR = 3.0;             // 1:3
+input double SL_ATR_Mult = 2.0;
+
+// Daily loss cap
+input double MaxDailyLossPercent = 3.0;
+
+// Session times (broker time)
+input int LondonStart = 8;
+input int LondonEnd   = 12;
+input int NYStart     = 13;
+input int NYEnd       = 17;
+
+//================ GLOBALS =================
+int rsiHandle, atrHandle, macdHandle, htfEmaHandle;
+datetime lastBarTime = 0;
+
+double dayStartEquity = 0;
+int    currentDay = -1;
+
+//==================================================
+int OnInit()
+{
+   if(_Period != PERIOD_M15)
+   {
+      Print("Attach EA to M15 chart only.");
+      return INIT_FAILED;
+   }
+
+   rsiHandle  = iRSI(_Symbol, PERIOD_M15, RSI_Period, PRICE_CLOSE);
+   atrHandle  = iATR(_Symbol, PERIOD_M15, ATR_Period);
+   macdHandle = iMACD(_Symbol, PERIOD_M15,
+                      MACD_Fast, MACD_Slow, MACD_Signal,
+                      PRICE_CLOSE);
+   htfEmaHandle = iMA(_Symbol, PERIOD_H1,
+                      HTF_EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+
+   if(rsiHandle < 0 || atrHandle < 0 ||
+      macdHandle < 0 || htfEmaHandle < 0)
+      return INIT_FAILED;
+
+   ResetDailyEquity();
+   return INIT_SUCCEEDED;
+}
+
+//==================================================
+void OnTick()
+{
+   ResetDailyEquity();
+   ManageOpenPosition();
+
+   if(!IsNewBar()) return;
+   if(HasOpenPosition()) return;
+   if(!InTradingSession()) return;
+   if(DailyLossExceeded()) return;
+
+   double rsi[], atr[], macdMain[], macdSignal[];
+   double htfEma[], htfClose[];
+
+   if(CopyBuffer(rsiHandle,0,0,1,rsi)<=0) return;
+   if(CopyBuffer(atrHandle,0,0,1,atr)<=0) return;
+   if(CopyBuffer(macdHandle,0,0,1,macdMain)<=0) return;
+   if(CopyBuffer(macdHandle,1,0,1,macdSignal)<=0) return;
+   if(CopyBuffer(htfEmaHandle,0,0,1,htfEma)<=0) return;
+   if(CopyClose(_Symbol,PERIOD_H1,0,1,htfClose)<=0) return;
+
+   double macdHist = macdMain[0] - macdSignal[0];
+   double slope = RegressionSlope(5);
+
+   bool htfBull = htfClose[0] > htfEma[0];
+   bool htfBear = htfClose[0] < htfEma[0];
+
+   if(htfBull && rsi[0] > 55 && macdHist > 0 && slope > 0)
+      OpenTrade(ORDER_TYPE_BUY, atr[0]);
+
+   if(htfBear && rsi[0] < 45 && macdHist < 0 && slope < 0)
+      OpenTrade(ORDER_TYPE_SELL, atr[0]);
+}
+
+//================ CORE FUNCTIONS =================
+
+bool IsNewBar()
+{
+   datetime t = iTime(_Symbol, PERIOD_M15, 0);
+   if(t == lastBarTime) return false;
+   lastBarTime = t;
+   return true;
+}
+
+//--------------------------------------------------
+bool HasOpenPosition()
+{
+   for(int i=0;i<PositionsTotal();i++)
+      if(PositionGetTicket(i))
+         if(PositionGetInteger(POSITION_MAGIC)==MagicNumber &&
+            PositionGetString(POSITION_SYMBOL)==_Symbol)
+            return true;
+   return false;
+}
+
+//--------------------------------------------------
+bool InTradingSession()
+{
+   int hour = TimeHour(TimeCurrent());
+   return (hour>=LondonStart && hour<LondonEnd) ||
+          (hour>=NYStart && hour<NYEnd);
+}
+
+//--------------------------------------------------
+void ResetDailyEquity()
+{
+   int day = TimeDay(TimeCurrent());
+   if(day != currentDay)
+   {
+      currentDay = day;
+      dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   }
+}
+
+//--------------------------------------------------
+bool DailyLossExceeded()
+{
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double lossPct = (dayStartEquity - equity) / dayStartEquity * 100.0;
+   return lossPct >= MaxDailyLossPercent;
+}
+
+//--------------------------------------------------
+double RegressionSlope(int bars)
+{
+   double sx=0, sy=0, sxy=0, sx2=0;
+   for(int i=0;i<bars;i++)
+   {
+      double c = iClose(_Symbol, PERIOD_M15, i);
+      sx+=i; sy+=c; sxy+=i*c; sx2+=i*i;
+   }
+   return (bars*sxy - sx*sy)/(bars*sx2 - sx*sx);
+}
+
+//================ TRADE MANAGEMENT =================
+
+void ManageOpenPosition()
+{
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      if(!PositionGetTicket(i)) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=MagicNumber) continue;
+
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl = PositionGetDouble(POSITION_SL);
+      double tp = PositionGetDouble(POSITION_TP);
+      double vol = PositionGetDouble(POSITION_VOLUME);
+      int type = PositionGetInteger(POSITION_TYPE);
+
+      double price = (type==POSITION_TYPE_BUY)?
+                     SymbolInfoDouble(_Symbol,SYMBOL_BID):
+                     SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+      double risk = MathAbs(openPrice - sl);
+      double oneR = (type==POSITION_TYPE_BUY)?
+                    openPrice + risk:
+                    openPrice - risk;
+
+      // Break-even + partial close
+      if((type==POSITION_TYPE_BUY && price>=oneR) ||
+         (type==POSITION_TYPE_SELL && price<=oneR))
+      {
+         ModifySL(openPrice);
+         PartialClose(vol * 0.5);
+      }
+   }
+}
+
+//--------------------------------------------------
+void ModifySL(double newSL)
+{
+   MqlTradeRequest r; MqlTradeResult res;
+   ZeroMemory(r);
+   r.action = TRADE_ACTION_SLTP;
+   r.symbol = _Symbol;
+   r.sl = newSL;
+   OrderSend(r,res);
+}
+
+//--------------------------------------------------
+void PartialClose(double vol)
+{
+   MqlTradeRequest r; MqlTradeResult res;
+   ZeroMemory(r);
+   r.action = TRADE_ACTION_DEAL;
+   r.symbol = _Symbol;
+   r.volume = vol;
+   r.type = ORDER_TYPE_SELL;
+   r.price = SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   OrderSend(r,res);
+}
+
+//--------------------------------------------------
+void OpenTrade(ENUM_ORDER_TYPE type, double atr)
+{
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskMoney = equity * RiskPercent / 100.0;
+   double slDist = atr * SL_ATR_Mult;
+
+   double tickVal = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+   double tickSz  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+   double moneyPerLot = slDist/tickSz*tickVal;
+
+   double lot = riskMoney / moneyPerLot;
+
+   double minLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+   double step   = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   lot = MathMax(minLot,MathMin(lot,maxLot));
+   lot = NormalizeDouble(lot,(int)MathLog10(1.0/step));
+
+   double price = (type==ORDER_TYPE_BUY)?
+                  SymbolInfoDouble(_Symbol,SYMBOL_ASK):
+                  SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   double sl = (type==ORDER_TYPE_BUY)? price-slDist : price+slDist;
+   double tp = (type==ORDER_TYPE_BUY)? price+slDist*RR : price-slDist*RR;
+
+   MqlTradeRequest r; MqlTradeResult res;
+   ZeroMemory(r);
+   r.action=TRADE_ACTION_DEAL;
+   r.symbol=_Symbol;
+   r.volume=lot;
+   r.type=type;
+   r.price=price;
+   r.sl=sl;
+   r.tp=tp;
+   r.magic=MagicNumber;
+   r.deviation=10;
+
+   OrderSend(r,res);
+}
